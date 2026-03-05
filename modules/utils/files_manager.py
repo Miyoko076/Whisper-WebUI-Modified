@@ -5,7 +5,7 @@ from gradio.utils import NamedString
 
 from modules.utils.paths import DEFAULT_PARAMETERS_CONFIG_PATH
 
-AUDIO_EXTENSION = ['.mp3', '.wav', '.wma', '.aac', '.flac', '.ogg', '.m4a', '.aiff', '.alac', '.opus', '.webm', '.ac3',
+AUDIO_EXTENSION = ['.mp3', '.MP3', '.wav', '.wma', '.aac', '.flac', '.ogg', '.m4a', '.aiff', '.alac', '.opus', '.webm', '.ac3',
                    '.amr', '.au', '.mid', '.midi', '.mka']
 
 VIDEO_EXTENSION = ['.mp4', '.mkv', '.flv', '.avi', '.mov', '.wmv', '.webm', '.m4v', '.mpeg', '.mpg', '.3gp',

@@ -110,8 +110,7 @@ class InsanelyFastWhisperInference(BaseTranscriptionPipeline):
                 end=end
             ))
 
-        elapsed_time = time.time() - start_time
-        return segments_result, elapsed_time
+        return segments_result, segments
 
     def update_model(self,
                      model_size: str,

@@ -24,6 +24,11 @@ from modules.utils.audio_manager import validate_audio
 from modules.whisper.data_classes import *
 from modules.diarize.diarizer import Diarizer
 from modules.vad.silero_vad import SileroVAD
+from modules.aadnk.vad import VadSileroTranscription
+from modules.aadnk.whisper.abstractWhisperContainer import AbstractWhisperCallback
+from modules.aadnk.vad import TranscriptionConfig as AadnkTranscriptionConfig, NonSpeechStrategy
+import tempfile
+
 
 
 logger = get_logger()
@@ -84,54 +89,45 @@ class BaseTranscriptionPipeline(ABC):
             progress_callback: Optional[Callable] = None,
             *pipeline_params,
             ) -> Tuple[List[Segment], float]:
-        """
-        Run transcription with conditional pre-processing and post-processing.
-        The VAD will be performed to remove noise from the audio input in pre-processing, if enabled.
-        The diarization will be performed in post-processing, if enabled.
-        Due to the integration with gradio, the parameters have to be specified with a `*` wildcard.
-
-        Parameters
-        ----------
-        audio: Union[str, BinaryIO, np.ndarray]
-            Audio input. This can be file path or binary type.
-        progress: gr.Progress
-            Indicator to show progress directly in gradio.
-        file_format: str
-            Subtitle file format between ["SRT", "WebVTT", "txt", "lrc"]
-        add_timestamp: bool
-            Whether to add a timestamp at the end of the filename.
-        progress_callback: Optional[Callable]
-            callback function to show progress. Can be used to update progress in the backend.
-
-        *pipeline_params: tuple
-            Parameters for the transcription pipeline. This will be dealt with "TranscriptionPipelineParams" data class.
-            This must be provided as a List with * wildcard because of the integration with gradio.
-            See more info at : https://github.com/gradio-app/gradio/issues/2471
-
-        Returns
-        ----------
-        segments_result: List[Segment]
-            list of Segment that includes start, end timestamps and transcribed text
-        elapsed_time: float
-            elapsed time for running
-        """
-        start_time = time.time()
+        
+        all_params = list(pipeline_params)
+        
+        # --- 1. AADNK 및 할루시네이션 파라미터 15개 추출 ---
+        aadnk_params = all_params[-15:]
+        aadnk_vad_enable = aadnk_params[0]
+        aadnk_vad_mode = aadnk_params[1]
+        aadnk_vad_merge_window = aadnk_params[2]
+        aadnk_vad_max_merge_size = aadnk_params[3]
+        aadnk_vad_padding = aadnk_params[4]
+        aadnk_vad_prompt_window = aadnk_params[5]
+        
+        hal_enable = aadnk_params[6]
+        hal_cr_threshold = aadnk_params[7]
+        hal_strategy = aadnk_params[8]
+        hal_temp_start = aadnk_params[9]
+        hal_temp_step = aadnk_params[10]
+        hal_temp_retry = aadnk_params[11]
+        hal_time_start = aadnk_params[12]
+        hal_time_step = aadnk_params[13]
+        hal_time_retry = aadnk_params[14]
+        
+        original_pipeline_params = tuple(all_params[:-15])
 
         if not validate_audio(audio):
             return [Segment()], 0
 
-        params = TranscriptionPipelineParams.from_list(list(pipeline_params))
+        params = TranscriptionPipelineParams.from_list(list(original_pipeline_params))
         params = self.validate_gradio_values(params)
-        bgm_params, vad_params, whisper_params, diarization_params = params.bgm_separation, params.vad, params.whisper, params.diarization
+        bgm_params = params.bgm_separation
+        vad_params = params.vad
+
+        if aadnk_vad_enable and vad_params.vad_filter:
+            logger.info(f"Both VADs enabled. Overriding existing VAD with 'aadnk' VAD.")
 
         if bgm_params.is_separate_bgm:
             music, audio, _ = self.music_separator.separate(
-                audio=audio,
-                model_name=bgm_params.uvr_model_size,
-                device=bgm_params.uvr_device,
-                segment_size=bgm_params.segment_size,
-                save_file=bgm_params.save_file,
-                progress=progress
+                audio=audio, model_name=bgm_params.uvr_model_size, device=bgm_params.uvr_device,
+                segment_size=bgm_params.segment_size, save_file=bgm_params.save_file, progress=progress
             )
 
             if audio.ndim >= 2:
@@ -142,76 +138,212 @@ class BaseTranscriptionPipeline(ABC):
                     origin_sample_rate = self.music_separator.audio_info.sample_rate
                 audio = self.resample_audio(audio=audio, original_sample_rate=origin_sample_rate)
 
-            if bgm_params.enable_offload:
-                self.music_separator.offload()
-            elapsed_time_bgm_sep = time.time() - start_time
+            if bgm_params.enable_offload: self.music_separator.offload()
 
-        origin_audio = deepcopy(audio)
+        if not aadnk_vad_enable:
+            # --- 기존 로직 ---
+            start_time = time.time()
+            whisper_params, diarization_params = params.whisper, params.diarization
+            origin_audio = deepcopy(audio)
 
-        if vad_params.vad_filter:
-            progress(0, desc="Filtering silent parts from audio..")
-            vad_options = VadOptions(
-                threshold=vad_params.threshold,
-                min_speech_duration_ms=vad_params.min_speech_duration_ms,
-                max_speech_duration_s=vad_params.max_speech_duration_s,
-                min_silence_duration_ms=vad_params.min_silence_duration_ms,
-                speech_pad_ms=vad_params.speech_pad_ms
+            if vad_params.vad_filter:
+                progress(0, desc="Filtering silent parts from audio..")
+                vad_options = VadOptions(
+                    threshold=vad_params.threshold, min_speech_duration_ms=vad_params.min_speech_duration_ms,
+                    max_speech_duration_s=vad_params.max_speech_duration_s, min_silence_duration_ms=vad_params.min_silence_duration_ms,
+                    speech_pad_ms=vad_params.speech_pad_ms
+                )
+                vad_processed, speech_chunks = self.vad.run(audio=audio, vad_parameters=vad_options, progress=progress)
+                if vad_processed.size > 0:
+                    audio = vad_processed
+                else:
+                    vad_params.vad_filter = False
+
+            result, info = self.transcribe(audio, progress, progress_callback, *whisper_params.to_list())
+            if whisper_params.enable_offload: self.offload()
+
+            if vad_params.vad_filter:
+                restored_result = self.vad.restore_speech_timestamps(segments=result, speech_chunks=speech_chunks)
+                if restored_result:
+                    result = restored_result
+                else:
+                    logger.info("VAD detected no speech segments in the audio.")
+
+            if diarization_params.is_diarize:
+                progress(0.99, desc="Diarizing speakers..")
+                result, elapsed_time_diarization = self.diarizer.run(
+                    audio=origin_audio, use_auth_token=diarization_params.hf_token if diarization_params.hf_token else os.environ.get("HF_TOKEN"),
+                    transcribed_result=result, device=diarization_params.diarization_device
+                )
+                if diarization_params.enable_offload: self.diarizer.offload()
+
+            self.cache_parameters(params=params, file_format=file_format, add_timestamp=add_timestamp)
+
+            if not result:
+                logger.info(f"Whisper did not detected any speech segments in the audio.")
+                result = [Segment()]
+
+            progress(1.0, desc="Finished.")
+            total_elapsed_time = time.time() - start_time
+            return result, total_elapsed_time
+            
+        else:
+            # --- 2. AADNK VAD 로직 (할루시네이션 복구 포함) ---
+            start_time = time.time()
+            whisper_params = params.whisper
+            diarization_params = params.diarization
+
+            audio_path = audio
+            if not isinstance(audio, str):
+                temp_audio_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                audio_path = temp_audio_file.name
+                torchaudio.save(audio_path, torch.from_numpy(audio).unsqueeze(0), 16000)
+
+            hal_configs = {
+                "enable": hal_enable,
+                "cr_threshold": hal_cr_threshold,
+                "strategy": hal_strategy,
+                "temp_start": hal_temp_start,
+                "temp_step": hal_temp_step,
+                "temp_retry": int(hal_temp_retry),
+                "time_start_sec": hal_time_start,
+                "time_step_sec": hal_time_step,
+                "time_retry": int(hal_time_retry)
+            }
+
+            class WrapperCallback(AbstractWhisperCallback):
+                def __init__(self, pipeline, base_whisper_params, progress_obj, configs):
+                    self.pipeline = pipeline
+                    self.base_whisper_params = base_whisper_params
+                    self.progress = progress_obj
+                    self.configs = configs
+
+                def invoke(self, audio_chunk, segment_index, prompt, lang, progress_listener):
+                    lang_code = self.base_whisper_params.lang or lang
+
+                    # 결과 포맷팅 도우미 함수 (위치 최상단으로 이동)
+                    def format_result(segs, inf):
+                        lc = lang_code
+                        if inf:
+                            if hasattr(inf, 'language'): lc = inf.language
+                            elif isinstance(inf, dict) and 'language' in inf: lc = inf.get('language')
+                        segs = segs or []
+                        txt = " ".join([s.text for s in segs])
+                        return {"text": txt, "segments": [s.model_dump() for s in segs], "language": lc}
+
+                    # 할루시네이션 필터 미사용 시 기존 로직대로 1회만 실행하고 즉시 반환
+                    if not self.configs["enable"]:
+                        segments, info = self.pipeline.transcribe(audio_chunk, self.progress, None, *self.base_whisper_params.to_list())
+                        return format_result(segments, info)
+
+                    # --- 할루시네이션 순차적 복구 알고리즘 시작 ---
+                    best_segments = None
+                    best_info = None
+                    best_logprob = -float('inf')
+
+                    def attempt_transcription(audio_data, temp_val):
+                        nonlocal best_segments, best_info, best_logprob
+                        current_params = deepcopy(self.base_whisper_params)
+                        current_params.temperature = temp_val
+                        
+                        segments, info = self.pipeline.transcribe(audio_data, self.progress, None, *current_params.to_list())
+                        
+                        is_hallucinating = False
+                        current_avg_logprob = -float('inf')
+                        
+                        if segments:
+                            logprobs = []
+                            for s in segments:
+                                cr = getattr(s, 'compression_ratio', 0)
+                                lp = getattr(s, 'avg_logprob', -1.0)
+                                logprobs.append(lp)
+                                if cr is not None and cr >= self.configs["cr_threshold"]:
+                                    is_hallucinating = True
+                            current_avg_logprob = sum(logprobs) / len(logprobs)
+                        else:
+                            is_hallucinating = True
+
+                        if current_avg_logprob > best_logprob:
+                            best_logprob = current_avg_logprob
+                            best_segments = segments
+                            best_info = info
+
+                        return not is_hallucinating, segments, info
+
+                    # 1. Baseline: 최초 1회 기본 시도
+                    success, segs, info = attempt_transcription(audio_chunk, self.configs["temp_start"])
+                    if success:
+                        logger.info(f"[Seg {segment_index}] 정상 통과 (Temp: {self.configs['temp_start']:.2f})")
+                        return format_result(segs, info)
+
+                    # 2. Phase 1: Temp+ 전략 수행
+                    if "Temp+" in self.configs["strategy"]:
+                        for retry in range(1, self.configs["temp_retry"] + 1):
+                            current_temp = round(min(self.configs["temp_start"] + (self.configs["temp_step"] * retry), 1.0), 2)
+                            logger.info(f"[Seg {segment_index}] 환각 감지. 온도를 {current_temp:.2f}로 변경하여 재시도합니다. ({retry}/{self.configs['temp_retry']})")
+                            success, segs, info = attempt_transcription(audio_chunk, current_temp)
+                            if success:
+                                return format_result(segs, info)
+
+                    # 3. Phase 2: Time+ 전략 수행 (온도 조절 실패 시)
+                    if "Time+" in self.configs["strategy"]:
+                        for retry in range(1, self.configs["time_retry"] + 1):
+                            trunc_sec = self.configs["time_start_sec"] + (self.configs["time_step_sec"] * (retry - 1))
+                            trunc_samples = int(trunc_sec * 16000)
+                            
+                            if trunc_samples >= len(audio_chunk):
+                                logger.warning(f"[Seg {segment_index}] 절삭 시간이 오디오 길이를 초과했습니다. Time+ 중단.")
+                                break
+                                
+                            logger.info(f"[Seg {segment_index}] 앞 {trunc_sec:.2f}s 절삭 후 기본 온도로 재시도합니다. ({retry}/{self.configs['time_retry']})")
+                            truncated_audio = audio_chunk[trunc_samples:]
+                            
+                            success, segs, info = attempt_transcription(truncated_audio, self.configs["temp_start"])
+                            if success:
+                                return format_result(segs, info)
+
+                    # 4. 모든 복구 실패: 베스트 반환
+                    logger.warning(f"[Seg {segment_index}] 모든 복구 전략 실패. 가장 품질이 높았던 결과를 강제로 반환합니다.")
+                    return format_result(best_segments, best_info)
+
+            whisper_callback = WrapperCallback(self, whisper_params, progress, hal_configs)
+
+            aadnk_vad_model = VadSileroTranscription()
+            
+            vad_strategy = NonSpeechStrategy.SKIP
+            if aadnk_vad_mode == "silero-vad":
+                vad_strategy = NonSpeechStrategy.CREATE_SEGMENT
+            elif aadnk_vad_mode == "silero-vad-skip-gaps":
+                vad_strategy = NonSpeechStrategy.SKIP
+            elif aadnk_vad_mode == "silero-vad-expand-into-gaps":
+                vad_strategy = NonSpeechStrategy.EXPAND_SEGMENT
+
+            config = AadnkTranscriptionConfig(
+                non_speech_strategy=vad_strategy,
+                max_silent_period=aadnk_vad_merge_window,
+                max_merge_size=aadnk_vad_max_merge_size
             )
 
-            vad_processed, speech_chunks = self.vad.run(
-                audio=audio,
-                vad_parameters=vad_options,
-                progress=progress
-            )
+            progress(0, desc="[aadnk VAD] Running VAD and transcription...")
+            result_dict = aadnk_vad_model.transcribe(audio_path, whisper_callback, config)
+            segments_result = [Segment.model_validate(s) for s in result_dict.get("segments", [])]
 
-            if vad_processed.size > 0:
-                audio = vad_processed
-            else:
-                vad_params.vad_filter = False
+            if diarization_params.is_diarize:
+                progress(0.99, desc="Diarizing speakers..")
+                origin_audio, _ = torchaudio.load(audio_path)
+                segments_result, _ = self.diarizer.run(
+                    audio=origin_audio, use_auth_token=diarization_params.hf_token if diarization_params.hf_token else os.environ.get("HF_TOKEN"),
+                    transcribed_result=segments_result, device=diarization_params.diarization_device
+                )
+                if diarization_params.enable_offload: self.diarizer.offload()
 
-        result, elapsed_time_transcription = self.transcribe(
-            audio,
-            progress,
-            progress_callback,
-            *whisper_params.to_list()
-        )
-        if whisper_params.enable_offload:
-            self.offload()
+            if not segments_result:
+                logger.info(f"Whisper did not detected any speech segments in the audio.")
+                segments_result = [Segment()]
 
-        if vad_params.vad_filter:
-            restored_result = self.vad.restore_speech_timestamps(
-                segments=result,
-                speech_chunks=speech_chunks,
-            )
-            if restored_result:
-                result = restored_result
-            else:
-                logger.info("VAD detected no speech segments in the audio.")
-
-        if diarization_params.is_diarize:
-            progress(0.99, desc="Diarizing speakers..")
-            result, elapsed_time_diarization = self.diarizer.run(
-                audio=origin_audio,
-                use_auth_token=diarization_params.hf_token if diarization_params.hf_token else os.environ.get("HF_TOKEN"),
-                transcribed_result=result,
-                device=diarization_params.diarization_device
-            )
-            if diarization_params.enable_offload:
-                self.diarizer.offload()
-
-        self.cache_parameters(
-            params=params,
-            file_format=file_format,
-            add_timestamp=add_timestamp
-        )
-
-        if not result:
-            logger.info(f"Whisper did not detected any speech segments in the audio.")
-            result = [Segment()]
-
-        progress(1.0, desc="Finished.")
-        total_elapsed_time = time.time() - start_time
-        return result, total_elapsed_time
+            total_elapsed_time = time.time() - start_time
+            progress(1.0, desc="Finished.")
+            return segments_result, total_elapsed_time
 
     def transcribe_file(self,
                         files: Optional[List] = None,

@@ -74,17 +74,16 @@ class WhisperInference(BaseTranscriptionPipeline):
                                        patience=params.patience,
                                        temperature=params.temperature,
                                        compression_ratio_threshold=params.compression_ratio_threshold,
-                                       progress_callback=progress_callback,)["segments"]
+                                       progress_callback=progress_callback,)
         segments_result = []
-        for segment in result:
+        for segment in result["segments"]:
             segments_result.append(Segment(
                 start=segment["start"],
                 end=segment["end"],
                 text=segment["text"]
             ))
 
-        elapsed_time = time.time() - start_time
-        return segments_result, elapsed_time
+        return segments_result, result
 
     def update_model(self,
                      model_size: str,

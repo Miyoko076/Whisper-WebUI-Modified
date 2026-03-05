@@ -111,8 +111,7 @@ class FasterWhisperInference(BaseTranscriptionPipeline):
                 progress_callback(progress_n)
             segments_result.append(Segment.from_faster_whisper(segment))
 
-        elapsed_time = time.time() - start_time
-        return segments_result, elapsed_time
+        return segments_result, info
 
     def update_model(self,
                      model_size: str,

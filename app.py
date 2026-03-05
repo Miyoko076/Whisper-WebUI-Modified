@@ -87,7 +87,44 @@ class App:
                                                                     available_devices=self.whisper_inf.diarizer.available_device,
                                                                     device=self.whisper_inf.diarizer.device)
 
-        pipeline_inputs = [dd_model, dd_lang, cb_translate] + whisper_inputs + vad_inputs + diarization_inputs + uvr_inputs
+        with gr.Accordion(_("VAD (aadnk)"), open=False):
+            aadnk_vad_enable = gr.Checkbox(label="Silero VAD 필터 활성화", value=True)
+            gr.Markdown("서브 모델에 의해 목소리라고 판단된 부분만 받아쓰기를 진행합니다.")
+            aadnk_vad_input = gr.Dropdown(choices=["silero-vad", "silero-vad-skip-gaps", "silero-vad-expand-into-gaps"], value="silero-vad", label="VAD Mode")
+            
+            aadnk_vad_merge_window = gr.Number(value=5.0, label="VAD - Merge Window (s)", info="인접한 음성 구간 사이의 간격이 이 시간보다 짧으면 하나로 병합합니다. (추천: 0.5~1.0초)")
+            aadnk_vad_max_merge_size = gr.Number(value=30.0, label="VAD - Max Merge Size (s)", info="병합된 음성 구간의 길이가 이 시간을 초과하지 않도록 제한합니다.")
+            aadnk_vad_padding = gr.Number(value=1.0, label="VAD - Padding (s)", info="감지된 음성 구간의 앞뒤로 추가할 여유 시간(초)입니다.")
+            aadnk_vad_prompt_window = gr.Number(value=3.0, label="VAD - Prompt Window (s)", info="이전 음성의 텍스트를 다음 구간의 프롬프트로 넘겨줄 기준 시간입니다.")
+
+            gr.Markdown("### 할루시네이션 교정 옵션\n")
+            hal_enable = gr.Checkbox(label="할루시네이션 교정 알고리즘 활성화", value=False)
+            
+            with gr.Row():
+                hal_cr_threshold = gr.Number(value=2.4, label="Compression Ratio 임계값", info="이 수치 이상이면 환각으로 간주 (추천: 2.4~2.7)")
+                hal_strategy = gr.Radio(choices=["Temp+", "Time+", "Temp+Time+"], value="Temp+", label="교정 전략")
+            
+            gr.Markdown("**[Temp+] 온도 조절 설정**")
+            with gr.Row():
+                hal_temp_start = gr.Number(value=0.0, label="시작 Temperature", info="환각 감지 시 최초로 재시도할 온도입니다.")
+                hal_temp_step = gr.Number(value=0.07, label="Temperature 증가폭", info="재시도 시마다 온도를 얼마나 올릴지 결정합니다. (최대 1.0 제한)")
+                hal_temp_retry = gr.Number(value=6, precision=0, label="최대 재시도 횟수", info="온도를 올려가며 재시도할 최대 횟수입니다.")
+                
+            gr.Markdown("**[Time+] 시간 절삭 설정**")
+            with gr.Row():
+                hal_time_start = gr.Number(value=1, label="시작 절삭 시간(s)", info="온도 조절 실패 시 오디오 앞부분을 처음 잘라낼 시간입니다.")
+                hal_time_step = gr.Number(value=0.5, label="절삭 시간 증가폭(s)", info="재시도 시마다 추가로 잘라낼 시간입니다.")
+                hal_time_retry = gr.Number(value=20, precision=0, label="최대 재시도 횟수", info="오디오의 절삭을 재시도할 최대 횟수입니다.")
+
+            aadnk_vad_inputs = [
+                aadnk_vad_enable, aadnk_vad_input, aadnk_vad_merge_window, 
+                aadnk_vad_max_merge_size, aadnk_vad_padding, aadnk_vad_prompt_window,
+                hal_enable, hal_cr_threshold, hal_strategy,
+                hal_temp_start, hal_temp_step, hal_temp_retry,
+                hal_time_start, hal_time_step, hal_time_retry
+            ]
+
+        pipeline_inputs = [dd_model, dd_lang, cb_translate] + whisper_inputs + vad_inputs + diarization_inputs + uvr_inputs + aadnk_vad_inputs
 
         return (
             pipeline_inputs,
